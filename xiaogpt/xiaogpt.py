@@ -30,6 +30,7 @@ from xiaogpt.config import (
     LATEST_ASK_API,
     MI_ASK_SIMULATE_DATA,
     WAKEUP_KEYWORD,
+    POLL_FAIL_RETRY,
     Config,
 )
 from xiaogpt.utils import (
@@ -89,27 +90,66 @@ class MiGPT:
         self.log.addHandler(RichHandler())
         self.log.debug(config)
 
+    async def poll_manager(self, timeout=200.0, check_period=20.0):
+        async with ClientSession() as session:
+            self.poll_last_active = time.time()  # init poll_last_active
+            await self.init_mi_with_session(session)
+            task = asyncio.create_task(self.poll_latest_ask())
+            assert task is not None
+            while True:
+                await asyncio.sleep(check_period)
+                poll_last_period = time.time() - self.poll_last_active
+                self.log.debug("Poll manager. last period[%f]", poll_last_period)
+                if poll_last_period > timeout:
+                    self.log.warning("poll_latest_ask task timeout, restarting...")
+                    task.cancel()
+                    await self.init_mi_with_session(session)
+                    task = asyncio.create_task(self.poll_latest_ask())
+                    assert task is not None
+                    continue
+
     async def poll_latest_ask(self):
         async with ClientSession() as session:
+            self.poll_fail_cnt = 0
             session._cookie_jar = self.cookie_jar
             while True:
                 self.log.debug(
-                    "Listening new message, timestamp: %s", self.last_timestamp
+                    "Poll loop. Start. last_ts[%s]. fail_cnt[%d]. last_active[%f]",
+                    self.last_timestamp,
+                    self.poll_fail_cnt,
+                    self.poll_last_active,
                 )
-                await self.get_latest_ask_from_xiaoai(session)
+                self.poll_last_active = time.time()  # update poll event
+                if self.poll_fail_cnt < 0:
+                    session._cookie_jar = self.cookie_jar
+                    self.poll_fail_cnt = 0
+                self.log.debug("Poll loop. Listening new message")
+                try:
+                    await asyncio.wait_for(
+                        self.get_latest_ask_from_xiaoai(session), timeout=40.0
+                    )
+                except asyncio.TimeoutError:
+                    self.log.warning("Poll loop. Wait for new message timeout")
+                    self._handle_fail_poll()
+
                 start = time.perf_counter()
-                self.log.debug("Polling_event, timestamp: %s", self.last_timestamp)
+                self.log.debug("Poll loop. Wait for polling_event")
                 await self.polling_event.wait()
                 if (d := time.perf_counter() - start) < 1:
                     # sleep to avoid too many request
-                    self.log.debug("Sleep %f, timestamp: %s", d, self.last_timestamp)
+                    self.log.debug("Poll loop. Sleep %f", d)
                     await asyncio.sleep(1 - d)
 
-    async def init_all_data(self, session):
-        await self.login_miboy(session)
-        await self._init_data_hardware()
-        session.cookie_jar.update_cookies(self.get_cookie())
-        self.cookie_jar = session.cookie_jar
+    async def init_mi_with_session(self, session):
+        try:
+            await self.login_miboy(session)
+            await self._init_data_hardware()
+            session.cookie_jar.update_cookies(self.get_cookie())
+            self.cookie_jar = session.cookie_jar
+        except Exception as e:
+            self.log.warning("init_mi_with_session get exception: %s" % str(e))
+
+    def init_edge_tts_srv(self):
         if self.config.enable_edge_tts and self.config.localhost:
             self.start_http_server()
 
@@ -247,21 +287,39 @@ class MiGPT:
             try:
                 data = await r.json()
             except Exception:
-                self.log.warning("get latest ask from xiaoai error, retry")
+                self.log.warning(
+                    "get latest ask from xiaoai error[%s]. retrying", str(e)
+                )
             else:
                 return self._get_last_query(data)
+        return self._handle_fail_poll()
 
     def _get_last_query(self, data):
-        if d := data.get("data"):
-            records = json.loads(d).get("records")
-            if not records:
-                return
-            last_record = records[0]
-            timestamp = last_record.get("time")
-            if timestamp > self.last_timestamp:
-                self.last_timestamp = timestamp
-                self.last_record = last_record
-                self.new_record_event.set()
+        d = data.get("data")
+        if not d:
+            return self._handle_fail_poll()
+
+        records = json.loads(d).get("records")
+        if not records:
+            return self._handle_fail_poll()
+
+        # record get success
+        # clear fail count before new_record_event is set
+        self.poll_fail_cnt = 0
+        last_record = records[0]
+        timestamp = last_record.get("time")
+        if timestamp > self.last_timestamp:
+            self.last_timestamp = timestamp
+            self.last_record = last_record
+            self.new_record_event.set()
+        # poll success, return
+        return
+
+    def _handle_fail_poll(self):
+        self.poll_fail_cnt += 1
+        if self.poll_fail_cnt > POLL_FAIL_RETRY:
+            # wake up main thread to reset session
+            self.new_record_event.set()
 
     async def do_tts(self, value, wait_for_finish=False):
         if not self.config.use_command:
@@ -432,8 +490,9 @@ class MiGPT:
     async def run_forever(self):
         ask_name = self.config.bot.upper()
         async with ClientSession() as session:
-            await self.init_all_data(session)
-            task = asyncio.create_task(self.poll_latest_ask())
+            await self.init_mi_with_session(session)
+            self.init_edge_tts_srv()
+            task = asyncio.create_task(self.poll_manager())
             assert task is not None  # to keep the reference to task, do not remove this
             print(f"Running xiaogpt now, 用`{'/'.join(self.config.keyword)}`开头来提问")
             print(f"或用`{self.config.start_conversation}`开始持续对话")
@@ -441,8 +500,15 @@ class MiGPT:
                 self.polling_event.set()
                 await self.new_record_event.wait()
                 self.new_record_event.clear()
-                new_record = self.last_record
                 self.polling_event.clear()  # stop polling when processing the question
+                if self.poll_fail_cnt > POLL_FAIL_RETRY:
+                    # reset session
+                    print("访问小米服务反复失败，重试连接中。。。")
+                    await self.init_mi_with_session(session)
+                    self.poll_fail_cnt = -1  # let poll task reset cookie
+                    continue
+
+                new_record = self.last_record
                 query = new_record.get("query", "").strip()
 
                 if query == self.config.start_conversation:
